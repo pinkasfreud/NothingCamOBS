@@ -5,6 +5,7 @@ import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.params.OutputConfiguration
 import android.hardware.camera2.params.SessionConfiguration
@@ -40,7 +41,7 @@ class MainActivity : AppCompatActivity() {
     private var captureSession: CameraCaptureSession? = null
     private var previewRequestBuilder: CaptureRequest.Builder? = null
 
-    private lateinit var previewSurfaceView: SurfaceView
+    private lateinit var previewTextureView: TextureView
     private var previewSurface: Surface? = null
 
     // Video Stream & Encoder (1080p 30fps @ 35 Mbps)
@@ -66,11 +67,12 @@ class MainActivity : AppCompatActivity() {
     // Manuel Kontrol Değişkenleri
     private var isAutoExposure = true
     private var manualIso = 200
-    private var manualShutterNs = 16_666_666L // 1/60s
+    private var manualShutterNs = 16_666_666L
     private var isAutoFocus = true
     private var manualFocusDistance = 0.0f
     private var isoRange: Range<Int> = Range(50, 3200)
     private var minFocusDistance = 10.0f
+    private var bestFpsRange: Range<Int> = Range(15, 30)
 
     private lateinit var statusText: TextView
     private lateinit var lensButtonContainer: LinearLayout
@@ -101,19 +103,20 @@ class MainActivity : AppCompatActivity() {
     private fun setupUi() {
         val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
-        previewSurfaceView = SurfaceView(this)
-        root.addView(previewSurfaceView, FrameLayout.LayoutParams(
+        previewTextureView = TextureView(this)
+        root.addView(previewTextureView, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.MATCH_PARENT
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            Gravity.CENTER
         ))
 
         // Üst Bilgi Çubuğu
         statusText = TextView(this).apply {
             setTextColor(Color.GREEN)
-            setBackgroundColor(0x88000000.toInt())
+            setBackgroundColor(0x99000000.toInt())
             setPadding(24, 12, 24, 12)
             textSize = 13f
-            text = "OBS Bekleniyor (Port 8888) | 1080p 35Mbps"
+            text = "Kamera Başlatılıyor..."
         }
         root.addView(statusText, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -121,14 +124,13 @@ class MainActivity : AppCompatActivity() {
             Gravity.TOP or Gravity.START
         ).apply { setMargins(24, 24, 24, 0) })
 
-        // Sağ Kontrol Paneli (Manuel Ayarlar)
+        // Sağ Kontrol Paneli
         val controlPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(0x99111111.toInt())
             setPadding(24, 20, 24, 20)
         }
 
-        // Auto / Manuel Pozlama Anahtarı
         val aeSwitch = Switch(this).apply {
             text = "Otomatik Pozlama (AE) "
             setTextColor(Color.WHITE)
@@ -140,7 +142,6 @@ class MainActivity : AppCompatActivity() {
         }
         controlPanel.addView(aeSwitch)
 
-        // ISO Kaydırıcı
         val isoLabel = TextView(this).apply { text = "ISO: 200"; setTextColor(Color.LTGRAY); textSize = 12f }
         val isoSeek = SeekBar(this).apply {
             max = 100
@@ -159,7 +160,6 @@ class MainActivity : AppCompatActivity() {
         controlPanel.addView(isoLabel)
         controlPanel.addView(isoSeek)
 
-        // Enstantane (Shutter) Kaydırıcı (1/30s - 1/500s)
         val shutterOptions = listOf(
             "1/30s" to 33_333_333L,
             "1/50s" to 20_000_000L,
@@ -187,7 +187,6 @@ class MainActivity : AppCompatActivity() {
         controlPanel.addView(shutterLabel)
         controlPanel.addView(shutterSeek)
 
-        // Odak Kilidi (AF / MF)
         val afSwitch = Switch(this).apply {
             text = "Otomatik Odak (AF) "
             setTextColor(Color.WHITE)
@@ -219,18 +218,20 @@ class MainActivity : AppCompatActivity() {
             Gravity.TOP or Gravity.END
         ).apply { setMargins(0, 24, 24, 0) })
 
-        // Alt Lens Seçici Çubuk
+        // Alt Lens Seçici Çubuk (Yatay Kaydırılabilir)
+        val scrollView = HorizontalScrollView(this)
         lensButtonContainer = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER
             setBackgroundColor(0x99000000.toInt())
             setPadding(16, 12, 16, 12)
         }
-        root.addView(lensButtonContainer, FrameLayout.LayoutParams(
+        scrollView.addView(lensButtonContainer)
+        root.addView(scrollView, FrameLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT,
             ViewGroup.LayoutParams.WRAP_CONTENT,
             Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-        ).apply { setMargins(0, 0, 0, 24) })
+        ).apply { setMargins(24, 0, 24, 24) })
 
         setContentView(root)
     }
@@ -239,63 +240,94 @@ class MainActivity : AppCompatActivity() {
         discoverAllPhysicalLenses()
         startHardwareEncoderAndTcpServer()
 
-        previewSurfaceView.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                holder.setFixedSize(streamWidth, streamHeight)
-                previewSurface = holder.surface
+        previewTextureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+                st.setDefaultBufferSize(streamWidth, streamHeight)
+                previewSurface = Surface(st)
                 availableLenses.firstOrNull()?.let { openLens(it) }
             }
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {}
-            override fun surfaceDestroyed(holder: SurfaceHolder) { previewSurface = null }
-        })
+            override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+                st.setDefaultBufferSize(streamWidth, streamHeight)
+            }
+            override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+                previewSurface?.release()
+                previewSurface = null
+                return true
+            }
+            override fun onSurfaceTextureUpdated(st: SurfaceTexture) {}
+        }
+
+        if (previewTextureView.isAvailable) {
+            previewTextureView.surfaceTexture?.let { st ->
+                st.setDefaultBufferSize(streamWidth, streamHeight)
+                previewSurface = Surface(st)
+                availableLenses.firstOrNull()?.let { openLens(it) }
+            }
+        }
     }
 
     private fun discoverAllPhysicalLenses() {
         availableLenses.clear()
-        val backPhysicalList = mutableListOf<LensOption>()
+        val backCandidates = mutableListOf<LensOption>()
+        val frontCandidates = mutableListOf<LensOption>()
+        val probedIds = LinkedHashSet<String>()
 
-        for (id in cameraManager.cameraIdList) {
-            val chars = cameraManager.getCameraCharacteristics(id)
-            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+        // Standart listeyi ve Nothing OS'un gizlediği 0..15 ID'lerini tara
+        cameraManager.cameraIdList.forEach { probedIds.add(it) }
+        for (i in 0..15) {
+            probedIds.add(i.toString())
+        }
+
+        for (id in probedIds) {
+            val chars = try {
+                cameraManager.getCameraCharacteristics(id)
+            } catch (_: Exception) {
+                null
+            } ?: continue
+
+            val facing = chars.get(CameraCharacteristics.LENS_FACING) ?: continue
+            val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 5.0f
 
             if (facing == CameraCharacteristics.LENS_FACING_BACK) {
-                val physicalIds = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
-                    chars.physicalCameraIds
-                } else emptySet()
-
-                if (physicalIds.isNotEmpty()) {
-                    for (physId in physicalIds) {
-                        val pChars = cameraManager.getCameraCharacteristics(physId)
-                        val focal = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 5.0f
-                        backPhysicalList.add(LensOption("", id, physId, focal))
+                backCandidates.add(LensOption("", id, null, focal))
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                    for (physId in chars.physicalCameraIds) {
+                        val pChars = try {
+                            cameraManager.getCameraCharacteristics(physId)
+                        } catch (_: Exception) { null } ?: continue
+                        val pFocal = pChars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: focal
+                        backCandidates.add(LensOption("", id, physId, pFocal))
                     }
-                } else {
-                    val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 5.0f
-                    backPhysicalList.add(LensOption("1x Ana", id, null, focal))
                 }
-            } else if (facing == CameraCharacteristics.LENS_FACING_FRONT) {
-                val focal = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)?.firstOrNull() ?: 3.0f
-                availableLenses.add(LensOption("Ön Kamera", id, null, focal))
+            } else if (facing == CameraCharacteristics.LENS_FACING_FRONT && frontCandidates.isEmpty()) {
+                frontCandidates.add(LensOption("Ön Kamera (ID:$id)", id, null, focal))
             }
         }
 
-        // Arka fiziksel lensleri odak uzaklığına göre sırala ve isimlendir (0.6x, 1x, 3x)
-        backPhysicalList.sortBy { it.focalLength }
-        val mainFocal = backPhysicalList.getOrNull(1)?.focalLength ?: backPhysicalList.firstOrNull()?.focalLength ?: 5.5f
+        // Aynı odak uzaklığına sahip sanal/çift kamera kombinasyonlarını sadeleştir (en düşük ID öncelikli)
+        val uniqueBack = backCandidates
+            .distinctBy { (it.focalLength * 10).roundToInt() }
+            .sortedBy { it.focalLength }
 
-        val labeledBack = backPhysicalList.map { lens ->
+        // Ana kamera ID "0" odak uzaklığını referans al
+        val mainFocal = backCandidates.firstOrNull { it.logicalId == "0" && it.physicalId == null }?.focalLength
+            ?: uniqueBack.getOrNull(1)?.focalLength
+            ?: uniqueBack.firstOrNull()?.focalLength
+            ?: 5.5f
+
+        val labeledBack = uniqueBack.map { lens ->
             val ratio = lens.focalLength / mainFocal
+            val idTag = lens.physicalId ?: lens.logicalId
             val name = when {
-                ratio < 0.8f -> "0.6x Ultra Geniş (ID:${lens.physicalId})"
-                ratio > 1.8f -> "${ratio.roundToInt()}x Telefoto (ID:${lens.physicalId})"
-                else -> "1x Ana Lens (ID:${lens.physicalId ?: lens.logicalId})"
+                lens.logicalId == "0" && lens.physicalId == null -> "1x Ana (ID:$idTag)"
+                ratio < 0.8f -> "0.6x Geniş (ID:$idTag)"
+                ratio > 1.8f -> "${ratio.roundToInt()}x Tele (ID:$idTag)"
+                else -> "${String.format("%.1f", ratio)}x Lens (ID:$idTag)"
             }
             lens.copy(label = name)
         }
 
-        // Ana lensi başa koy, sonra diğerlerini ekle
-        val sortedFinal = labeledBack.sortedByDescending { it.label.startsWith("1x") } + availableLenses
-        availableLenses.clear()
+        val sortedFinal = labeledBack.sortedByDescending { it.logicalId == "0" && it.physicalId == null } + frontCandidates
         availableLenses.addAll(sortedFinal)
 
         runOnUiThread {
@@ -312,23 +344,27 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startHardwareEncoderAndTcpServer() {
-        val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, streamWidth, streamHeight).apply {
-            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
-            setInteger(MediaFormat.KEY_BIT_RATE, streamBitrate)
-            setInteger(MediaFormat.KEY_FRAME_RATE, streamFps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-            setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
-        }
+        try {
+            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, streamWidth, streamHeight).apply {
+                setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
+                setInteger(MediaFormat.KEY_BIT_RATE, streamBitrate)
+                setInteger(MediaFormat.KEY_FRAME_RATE, streamFps)
+                setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+                setInteger(MediaFormat.KEY_BITRATE_MODE, MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR)
+            }
 
-        mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
-            configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-            encoderSurface = createInputSurface()
-            start()
+            mediaCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC).apply {
+                configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                encoderSurface = createInputSurface()
+                start()
+            }
+        } catch (e: Exception) {
+            runOnUiThread { statusText.text = "Encoder Hatası: ${e.message}" }
+            return
         }
 
         isStreaming = true
 
-        // TCP Sunucusu (Port 8888 - OBS Bağlantısı)
         Thread {
             try {
                 serverSocket = ServerSocket(8888)
@@ -339,26 +375,27 @@ class MainActivity : AppCompatActivity() {
                     spsPpsConfig?.let { out.write(it) }
                     clientOutputStream = out
 
-                    // Yeni istemci bağlandığında anında Keyframe (I-Frame) üret
                     val params = Bundle().apply {
                         putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0)
                     }
                     mediaCodec?.setParameters(params)
 
                     runOnUiThread {
-                        statusText.text = "OBS BAĞLI (Canlı Akış: 1080p @ 35 Mbps)"
+                        statusText.text = "OBS BAĞLI | ${currentLens?.label ?: ""} (1080p 35Mbps)"
                         statusText.setTextColor(Color.CYAN)
                     }
                 }
             } catch (_: Exception) {}
         }.start()
 
-        // Donanım Kodlayıcı Çıktı Döngüsü
         Thread {
             val bufferInfo = MediaCodec.BufferInfo()
             while (isStreaming) {
                 val codec = mediaCodec ?: break
-                val outIndex = codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                val outIndex = try {
+                    codec.dequeueOutputBuffer(bufferInfo, 10_000)
+                } catch (_: Exception) { -1 }
+
                 if (outIndex >= 0) {
                     val encodedData = codec.getOutputBuffer(outIndex)
                     if (encodedData != null && bufferInfo.size > 0) {
@@ -376,7 +413,7 @@ class MainActivity : AppCompatActivity() {
                         } catch (_: Exception) {
                             clientOutputStream = null
                             runOnUiThread {
-                                statusText.text = "OBS Bekleniyor (Port 8888)"
+                                statusText.text = "OBS Bekleniyor (Port 8888) | ${currentLens?.label ?: ""}"
                                 statusText.setTextColor(Color.GREEN)
                             }
                         }
@@ -398,46 +435,90 @@ class MainActivity : AppCompatActivity() {
         isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE) ?: Range(50, 3200)
         minFocusDistance = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10.0f
 
-        cameraManager.openCamera(lens.logicalId, object : CameraDevice.StateCallback() {
-            override fun onOpened(camera: CameraDevice) {
-                cameraDevice = camera
-                createCaptureSession(camera, lens)
+        val fpsRanges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES) ?: emptyArray()
+        bestFpsRange = fpsRanges.firstOrNull { it.lower == 30 && it.upper == 30 }
+            ?: fpsRanges.firstOrNull { it.upper == 30 }
+            ?: Range(15, 30)
+
+        runOnUiThread {
+            statusText.text = "Açılıyor: ${lens.label}..."
+            statusText.setTextColor(Color.YELLOW)
+        }
+
+        try {
+            cameraManager.openCamera(lens.logicalId, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraDevice = camera
+                    createCaptureSession(camera, lens)
+                }
+                override fun onDisconnected(camera: CameraDevice) {
+                    camera.close()
+                }
+                override fun onError(camera: CameraDevice, error: Int) {
+                    camera.close()
+                    runOnUiThread {
+                        statusText.text = "Lens Hatası (${lens.label}): Kod $error"
+                        statusText.setTextColor(Color.RED)
+                    }
+                }
+            }, cameraHandler)
+        } catch (e: Exception) {
+            runOnUiThread {
+                statusText.text = "Erişim Engellendi (${lens.label}): ${e.message}"
+                statusText.setTextColor(Color.RED)
             }
-            override fun onDisconnected(camera: CameraDevice) { camera.close() }
-            override fun onError(camera: CameraDevice, error: Int) { camera.close() }
-        }, cameraHandler)
+        }
     }
 
     private fun createCaptureSession(camera: CameraDevice, lens: LensOption) {
         val pSurface = previewSurface ?: return
-        val eSurface = encoderSurface ?: return
+        val eSurface = encoderSurface
 
+        val outputs = mutableListOf<OutputConfiguration>()
         val previewConfig = OutputConfiguration(pSurface).apply {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && lens.physicalId != null) {
                 setPhysicalCameraId(lens.physicalId)
             }
         }
-        val encoderConfig = OutputConfiguration(eSurface).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && lens.physicalId != null) {
-                setPhysicalCameraId(lens.physicalId)
+        outputs.add(previewConfig)
+
+        if (eSurface != null) {
+            val encoderConfig = OutputConfiguration(eSurface).apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P && lens.physicalId != null) {
+                    setPhysicalCameraId(lens.physicalId)
+                }
             }
+            outputs.add(encoderConfig)
         }
 
-        previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+        previewRequestBuilder = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
             addTarget(pSurface)
-            addTarget(eSurface)
+            if (eSurface != null) addTarget(eSurface)
         }
 
         val sessionConfig = SessionConfiguration(
             SessionConfiguration.SESSION_REGULAR,
-            listOf(previewConfig, encoderConfig),
+            outputs,
             sessionExecutor,
             object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
                     captureSession = session
                     updateRepeatingRequest()
+                    runOnUiThread {
+                        statusText.text = if (clientOutputStream != null) {
+                            "OBS BAĞLI | ${lens.label} (1080p 35Mbps)"
+                        } else {
+                            "OBS Bekleniyor (Port 8888) | ${lens.label}"
+                        }
+                        statusText.setTextColor(if (clientOutputStream != null) Color.CYAN else Color.GREEN)
+                    }
                 }
-                override fun onConfigureFailed(session: CameraCaptureSession) {}
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    runOnUiThread {
+                        statusText.text = "Oturum Hatası (${lens.label}) - Farklı lens deneyin"
+                        statusText.setTextColor(Color.RED)
+                    }
+                }
             }
         )
         camera.createCaptureSession(sessionConfig)
@@ -447,13 +528,11 @@ class MainActivity : AppCompatActivity() {
         val session = captureSession ?: return
         val builder = previewRequestBuilder ?: return
 
-        // Nothing ISP Kalite İyileştirmeleri (Camo'nun kapattığı keskinlik ve kumlanma azaltma)
         builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)
         builder.set(CaptureRequest.NOISE_REDUCTION_MODE, CaptureRequest.NOISE_REDUCTION_MODE_HIGH_QUALITY)
         builder.set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
-        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(streamFps, streamFps))
+        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, bestFpsRange)
 
-        // Pozlama (Auto vs Manuel ISO/Shutter)
         if (isAutoExposure) {
             builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         } else {
@@ -462,7 +541,6 @@ class MainActivity : AppCompatActivity() {
             builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, manualShutterNs)
         }
 
-        // Odak (Auto vs Manuel Odak Kilidi)
         if (isAutoFocus) {
             builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO)
         } else {
